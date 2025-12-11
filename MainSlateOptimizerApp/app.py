@@ -4,12 +4,12 @@ import streamlit as st
 from io import BytesIO
 
 # =============================================
-# SESSION STATE INIT (AT TOP)
+# SESSION STATE INIT
 # =============================================
 if "forced_players" not in st.session_state:
-    st.session_state.forced_players = {}      # {player_name: min_lineups}
+    st.session_state.forced_players = {}   # {player_name: min_lineups}
 if "caps" not in st.session_state:
-    st.session_state.caps = {}                # {player_name: max_lineups}
+    st.session_state.caps = {}             # {player_name: max_lineups}
 if "pairs_df" not in st.session_state:
     st.session_state.pairs_df = pd.DataFrame(
         columns=["Main", "Secondary", "Together", "RequireMain"]
@@ -48,13 +48,13 @@ def parse_opponent(gameinfo, team):
 
 def load_and_prepare_data(proj_file, sal_file, proj_col):
     """
-    Load projections (Excel) and DK salaries (CSV), merge them, and compute
-    a unified 'ProjPoints' column plus Opponent extraction.
+    Load projections (Excel) and DK salaries (CSV), merge them,
+    compute ProjPoints, Salary, Opponent.
     """
     proj = pd.read_excel(proj_file)
     dk = pd.read_csv(sal_file)
 
-    # Clean fields
+    # Clean text fields
     for df in (proj, dk):
         for col in ["Name", "Position", "TeamAbbrev"]:
             if col in df.columns:
@@ -245,19 +245,14 @@ def build_one_lineup(players,
 
 def restructure_lineup_for_export(lu, flex_idx, players, name_id_col):
     """
-    Turn a single lineup into a DK-style row:
-    QB, RB1, RB2, WR1, WR2, WR3, TE, FLEX, DST, Total_Salary
+    Build a dict with DK slots keyed by slot name, using Name+ID column.
     """
     SLOT_ORDER = ["QB", "RB1", "RB2", "WR1", "WR2", "WR3", "TE", "FLEX", "DST"]
 
     lu = lu.copy()
-    lu["Slot"] = lu.index.map(
-        lambda i: "FLEX" if i == flex_idx else lu.loc[i, "Position"]
-    )
 
-    # Build ordered RB / WR lists by salary desc
-    rb_df = lu[lu["Slot"] == "RB"].sort_values("Salary", ascending=False)
-    wr_df = lu[lu["Slot"] == "WR"].sort_values("Salary", ascending=False)
+    rb_df = lu[lu["Position"] == "RB"].sort_values("Salary", ascending=False)
+    wr_df = lu[lu["Position"] == "WR"].sort_values("Salary", ascending=False)
 
     rb_ids = list(rb_df.index)
     wr_ids = list(wr_df.index)
@@ -270,15 +265,15 @@ def restructure_lineup_for_export(lu, flex_idx, players, name_id_col):
     wr3 = wr_ids[2] if len(wr_ids) > 2 else None
 
     slot_map = {
-        "QB":  lu[lu["Slot"] == "QB"].index[0],
+        "QB":  lu[lu["Position"] == "QB"].index[0],
         "RB1": rb1,
         "RB2": rb2,
         "WR1": wr1,
         "WR2": wr2,
         "WR3": wr3,
-        "TE":  lu[lu["Slot"] == "TE"].index[0],
+        "TE":  lu[lu["Position"] == "TE"].index[0],
         "FLEX": flex_idx,
-        "DST": lu[lu["Slot"] == "DST"].index[0],
+        "DST": lu[lu["Position"] == "DST"].index[0],
     }
 
     rec = {}
@@ -298,6 +293,54 @@ def restructure_lineup_for_export(lu, flex_idx, players, name_id_col):
 
     rec["Total_Salary"] = total_salary
     return rec
+
+
+def build_display_lineup(lu, flex_idx, players):
+    """
+    Build a DataFrame in QB, RB1, RB2, WR1, WR2, WR3, TE, FLEX, DST order
+    for on-screen display (using Name, Team, Salary, Proj).
+    """
+    ordered_slots = ["QB", "RB1", "RB2", "WR1", "WR2", "WR3", "TE", "FLEX", "DST"]
+
+    lu = lu.copy()
+    rb_df = lu[lu["Position"] == "RB"].sort_values("Salary", ascending=False)
+    wr_df = lu[lu["Position"] == "WR"].sort_values("Salary", ascending=False)
+
+    rb_ids = list(rb_df.index)
+    wr_ids = list(wr_df.index)
+
+    rb1 = rb_ids[0] if len(rb_ids) > 0 else None
+    rb2 = rb_ids[1] if len(rb_ids) > 1 else None
+
+    wr1 = wr_ids[0] if len(wr_ids) > 0 else None
+    wr2 = wr_ids[1] if len(wr_ids) > 1 else None
+    wr3 = wr_ids[2] if len(wr_ids) > 2 else None
+
+    slot_map = {
+        "QB":  lu[lu["Position"] == "QB"].index[0],
+        "RB1": rb1,
+        "RB2": rb2,
+        "WR1": wr1,
+        "WR2": wr2,
+        "WR3": wr3,
+        "TE":  lu[lu["Position"] == "TE"].index[0],
+        "FLEX": flex_idx,
+        "DST": lu[lu["Position"] == "DST"].index[0],
+    }
+
+    rows = []
+    for slot in ordered_slots:
+        pid = slot_map[slot]
+        player = players.loc[pid]
+        rows.append({
+            "Slot": slot,
+            "Name": player["Name"],
+            "Team": player.get("TeamAbbrev", ""),
+            "Salary": int(player["Salary"]),
+            "Proj": round(float(player["ProjPoints"]), 2),
+        })
+
+    return pd.DataFrame(rows)
 
 
 # =============================================
@@ -383,11 +426,10 @@ player_list_sorted = sorted(players["Name"].unique())
 
 st.header("Exposures & Constraints")
 
-# ----- Forced Minimum Exposures (multiselect + per-player inputs) -----
+# ----- Forced Minimum Exposures -----
 with st.expander("Forced Minimum Lineups", expanded=True):
     st.markdown("Select players you want to **force** into at least N lineups.")
 
-    # Multiselect with current keys as default
     forced_selected = st.multiselect(
         "Players to force",
         player_list_sorted,
@@ -406,7 +448,6 @@ with st.expander("Forced Minimum Lineups", expanded=True):
         )
         new_forced[name] = int(cnt)
 
-    # Update session state to match UI
     st.session_state.forced_players = new_forced
 
     if new_forced:
@@ -415,7 +456,7 @@ with st.expander("Forced Minimum Lineups", expanded=True):
             [{"Player": n, "Min Lineups": c} for n, c in new_forced.items()]
         ))
 
-# ----- Max Caps (multiselect + per-player inputs) -----
+# ----- Max Caps -----
 with st.expander("Max Lineups Per Player (Caps)", expanded=False):
     st.markdown("Select players you want to **cap** at a maximum number of lineups.")
 
@@ -445,7 +486,7 @@ with st.expander("Max Lineups Per Player (Caps)", expanded=False):
             [{"Player": n, "Max Lineups": c} for n, c in new_caps.items()]
         ))
 
-# ----- Forced Pairs (data editor table) -----
+# ----- Forced Pairs -----
 with st.expander("Forced Pairs (Stacks / Correlations)", expanded=False):
     st.markdown(
         "Each row defines a pair:\n"
@@ -478,10 +519,8 @@ with st.expander("Forced Pairs (Stacks / Correlations)", expanded=False):
         }
     )
 
-    # Save cleaned version back to session_state
     st.session_state.pairs_df = pairs_df
 
-    # Show a filtered view of valid rows
     valid_rows = []
     for _, row in pairs_df.iterrows():
         m = row.get("Main")
@@ -608,24 +647,20 @@ if run_button:
         else:
             st.success(f"Generated {len(all_lineups)} lineups.")
 
-            # Show lineups
+            # Show lineups in DK slot order
             for i, (lu, fidx) in enumerate(zip(all_lineups, flex_indices), start=1):
                 total_salary = int(lu["Salary"].sum())
                 total_proj = float(lu["ProjPoints"].sum())
                 st.subheader(f"Lineup {i} — Salary: {total_salary}, Proj: {total_proj:.2f}")
 
-                lu_display = lu.copy()
-                lu_display["Slot"] = lu_display.index.map(
-                    lambda idx: "FLEX" if idx == fidx else lu_display.loc[idx, "Position"]
-                )
-                lu_display = lu_display[["Slot", "Name", "TeamAbbrev", "Position", "Salary", "ProjPoints"]]
-                st.dataframe(lu_display)
+                display_df = build_display_lineup(lu, fidx, players)
+                st.dataframe(display_df)
 
-            # CSV export
-            if "Name+ID" in players.columns:
-                name_id_col = "Name+ID"
-            elif "Name + ID" in players.columns:
+            # CSV export (using Name + ID)
+            if "Name + ID" in players.columns:
                 name_id_col = "Name + ID"
+            elif "Name+ID" in players.columns:
+                name_id_col = "Name+ID"
             else:
                 name_id_col = None
 
