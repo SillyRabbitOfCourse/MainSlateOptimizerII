@@ -110,6 +110,12 @@ def load_and_prepare_data(proj_file, sal_file, proj_col):
     else:
         players["Opponent"] = None
 
+    # ----------- REMOVE DUPLICATE PLAYERS -----------
+    # Keep the row with the highest salary if there are duplicates
+    players = players.sort_values("Salary", ascending=False)
+    players = players.drop_duplicates(subset=["Name", "Position", "TeamAbbrev"], keep="first")
+    players = players.reset_index(drop=True)
+
     return players, unmatched_dk, unmatched_proj
 
 
@@ -137,6 +143,12 @@ def build_one_lineup(players,
 
     prob = pulp.LpProblem("Lineup", pulp.LpMaximize)
     x = pulp.LpVariable.dicts("x", candidate_ids, 0, 1, pulp.LpBinary)
+
+    # ---------- HARD CONSTRAINT: NO DUPLICATE NAMES ----------
+    name_groups = players.loc[candidate_ids].groupby("Name").groups
+    for name, idxs in name_groups.items():
+        if len(idxs) > 1:
+            prob += pulp.lpSum(x[i] for i in idxs) <= 1
 
     TOTAL = 9
 
@@ -220,13 +232,16 @@ def build_one_lineup(players,
     for i in flex_pool:
         prob += flex_x[i] <= x[i]
 
+    # Exactly one FLEX
     prob += pulp.lpSum(flex_x[i] for i in flex_pool) == 1
 
+    # Enforce which positions allowed in FLEX
     for i in flex_pool:
         pos = players.loc[i, "Position"]
         if not flex_allowed[pos]:
             prob += flex_x[i] == 0
 
+    # Baseline counts excluding FLEX player
     RB_base = RB - pulp.lpSum(flex_x[i] for i in flex_pool if players.loc[i, "Position"] == "RB")
     WR_base = WR - pulp.lpSum(flex_x[i] for i in flex_pool if players.loc[i, "Position"] == "WR")
     TE_base = TE - pulp.lpSum(flex_x[i] for i in flex_pool if players.loc[i, "Position"] == "TE")
@@ -256,10 +271,8 @@ def assign_slots(lu, flex_idx, players):
     """
     Returns a dict:
         { "QB": idx, "RB1": idx, ..., "DST": idx }
-    Guaranteed no duplicates.
+    Guaranteed no duplicates in slots.
     """
-    SLOT_ORDER = ["QB", "RB1", "RB2", "WR1", "WR2", "WR3", "TE", "FLEX", "DST"]
-
     # Start with all chosen players
     remaining = set(lu.index)
 
@@ -276,6 +289,10 @@ def assign_slots(lu, flex_idx, players):
     dst = dst_ids[0]
     slot_map["DST"] = dst
     remaining.discard(dst)
+
+    # Remove FLEX from remaining so we don't assign it as RB/WR/TE too
+    if flex_idx in remaining:
+        remaining.discard(flex_idx)
 
     # RBs from remaining
     rb_list = [i for i in remaining if lu.loc[i, "Position"] == "RB"]
@@ -325,7 +342,7 @@ def assign_slots(lu, flex_idx, players):
     slot_map["TE"] = te
     remaining.discard(te)
 
-    # FLEX is explicitly chosen; ensure it's not conflicting
+    # FLEX is explicitly chosen
     slot_map["FLEX"] = flex_idx
 
     return slot_map
