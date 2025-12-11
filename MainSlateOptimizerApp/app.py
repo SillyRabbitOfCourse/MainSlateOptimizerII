@@ -1,196 +1,19 @@
-import math
 import pandas as pd
 import pulp
 import streamlit as st
 from io import BytesIO
 
 # =============================================
-# GLOBAL DEFAULTS
+# SESSION STATE INIT (MUST BE AT THE TOP)
 # =============================================
-PROJECTION_COL_DEFAULT = "FP_P75"
-
-
-# =============================================
-# CORE HELPER / OPTIMIZER LOGIC
-# =============================================
-
-def parse_opponent(gameinfo, team):
-    if not isinstance(gameinfo, str):
-        return None
-    parts = gameinfo.split()
-    token = next((p for p in parts if "@" in p), None)
-    if not token:
-        return None
-    try:
-        t1, t2 = token.split("@")
-        t1 = t1.strip()
-        t2 = t2.strip()
-    except ValueError:
-        return None
-    if team == t1: return t2
-    if team == t2: return t1
-    return None
-
-
-def load_and_prepare_data(proj_file, sal_file, proj_col):
-    proj = pd.read_excel(proj_file)
-    dk = pd.read_csv(sal_file)
-
-    # Clean fields
-    for df in (proj, dk):
-        for col in ["Name", "Position", "TeamAbbrev"]:
-            if col in df.columns:
-                df[col] = df[col].astype(str).strip()
-
-    merge_cols = ["Name", "Position", "TeamAbbrev"]
-
-    players = dk.merge(
-        proj[merge_cols + [proj_col]],
-        on=merge_cols,
-        how="left",
-        indicator=True
-    )
-
-    unmatched_dk = players[players["_merge"] == "left_only"].copy()
-    proj_check = proj.merge(dk[merge_cols], on=merge_cols, how="left", indicator=True)
-    unmatched_proj = proj_check[proj_check["_merge"] == "left_only"].copy()
-
-    players = players.drop(columns=["_merge"])
-    players["ProjPoints"] = players.apply(
-        lambda r: r["AvgPointsPerGame"] if r["Position"] == "DST" else r[proj_col],
-        axis=1
-    )
-    players = players.dropna(subset=["ProjPoints"])
-    players["Salary"] = pd.to_numeric(players["Salary"], errors="coerce")
-    players = players.dropna(subset=["Salary"])
-
-    if "Game Info" in players.columns:
-        players["Opponent"] = players.apply(
-            lambda r: parse_opponent(r["Game Info"], r["TeamAbbrev"]),
-            axis=1
-        )
-    else:
-        players["Opponent"] = None
-
-    return players, unmatched_dk, unmatched_proj
-
-
-def build_one_lineup(players,
-                     prev_lineups,
-                     forced_players,
-                     forced_pairs,
-                     pair_requires_main,
-                     max_allowed,
-                     used_counts,
-                     flex_allowed,
-                     min_non_dst_salary,
-                     SALARY_CAP,
-                     MIN_UNIQUE_PLAYERS):
-
-    candidate_ids = [i for i in players.index if used_counts[i] < max_allowed[i]]
-    if len(candidate_ids) < 9:
-        return None, None
-
-    prob = pulp.LpProblem("Lineup", pulp.LpMaximize)
-    x = pulp.LpVariable.dicts("x", candidate_ids, 0, 1, pulp.LpBinary)
-
-    TOTAL = 9
-    prob += pulp.lpSum(players.loc[i, "ProjPoints"] * x[i] for i in candidate_ids)
-    prob += pulp.lpSum(players.loc[i, "Salary"] * x[i] for i in candidate_ids) <= SALARY_CAP
-    prob += pulp.lpSum(x[i] for i in candidate_ids) == TOTAL
-
-    def pos_sum(P):
-        return pulp.lpSum(x[i] for i in candidate_ids if players.loc[i, "Position"] in P)
-
-    RB = pos_sum(["RB"])
-    WR = pos_sum(["WR"])
-    TE = pos_sum(["TE"])
-    DST = pos_sum(["DST"])
-    QB = pos_sum(["QB"])
-
-    prob += QB == 1
-    prob += DST == 1
-    prob += RB + WR + TE == 7
-    prob += RB >= 2
-    prob += WR >= 3
-    prob += TE >= 1
-
-    for prev in prev_lineups:
-        overlap = [i for i in prev if i in candidate_ids]
-        if overlap:
-            prob += pulp.lpSum(x[i] for i in overlap) <= TOTAL - MIN_UNIQUE_PLAYERS
-
-    for pid, remain in forced_players.items():
-        if remain > 0 and pid in candidate_ids:
-            prob += x[pid] == 1
-
-    for (main, sec), remain in forced_pairs.items():
-        if remain > 0 and main in candidate_ids and sec in candidate_ids:
-            prob += x[main] + x[sec] == 2
-
-    for (main, sec), req in pair_requires_main.items():
-        if req and main in candidate_ids and sec in candidate_ids:
-            prob += x[sec] <= x[main]
-
-    for i in candidate_ids:
-        if players.loc[i, "Position"] != "DST":
-            if players.loc[i, "Salary"] < min_non_dst_salary:
-                prob += x[i] == 0
-
-    for dst_id in candidate_ids:
-        if players.loc[dst_id, "Position"] != "DST":
-            continue
-        dst_team = players.loc[dst_id, "TeamAbbrev"]
-        if pd.isna(dst_team):
-            continue
-
-        for pid in candidate_ids:
-            pos = players.loc[pid, "Position"]
-            if pos not in ["RB", "QB"]:
-                continue
-            opp = players.loc[pid, "Opponent"]
-            if opp == dst_team:
-                prob += x[pid] + x[dst_id] <= 1
-
-    flex_positions = ["RB", "WR", "TE"]
-    flex_pool = [i for i in candidate_ids if players.loc[i, "Position"] in flex_positions]
-    flex_x = pulp.LpVariable.dicts("flex", flex_pool, 0, 1, pulp.LpBinary)
-
-    for i in flex_pool:
-        prob += flex_x[i] <= x[i]
-
-    prob += pulp.lpSum(flex_x[i] for i in flex_pool) == 1
-
-    for i in flex_pool:
-        pos = players.loc[i, "Position"]
-        if not flex_allowed[pos]:
-            prob += flex_x[i] == 0
-
-    RB_base = RB - pulp.lpSum(flex_x[i] for i in flex_pool if players.loc[i, "Position"] == "RB")
-    WR_base = WR - pulp.lpSum(flex_x[i] for i in flex_pool if players.loc[i, "Position"] == "WR")
-    TE_base = TE - pulp.lpSum(flex_x[i] for i in flex_pool if players.loc[i, "Position"] == "TE")
-
-    prob += RB_base >= 2
-    prob += WR_base >= 3
-    prob += TE_base >= 1
-
-    prob.solve(pulp.PULP_CBC_CMD(msg=False))
-    if pulp.LpStatus[prob.status] != "Optimal":
-        return None, None
-
-    chosen = [i for i in candidate_ids if x[i].value() == 1]
-
-    flex_idx = None
-    for i in flex_pool:
-        if flex_x[i].value() == 1:
-            flex_idx = i
-            break
-
-    return players.loc[chosen].copy(), flex_idx
-import pandas as pd
-import pulp
-import streamlit as st
-from io import BytesIO
+if "forced_players" not in st.session_state:
+    st.session_state.forced_players = {}          # {player_name: min_lineups}
+if "caps" not in st.session_state:
+    st.session_state.caps = {}                    # {player_name: max_lineups}
+if "forced_pairs" not in st.session_state:
+    st.session_state.forced_pairs = {}            # {(main_name, sec_name): count}
+if "pair_requires_main" not in st.session_state:
+    st.session_state.pair_requires_main = {}      # {(main_name, sec_name): bool}
 
 # =============================================
 # GLOBAL DEFAULTS
@@ -555,16 +378,6 @@ with col2:
             st.write("✅ All projection players matched DK salaries.")
         else:
             st.dataframe(unmatched_proj[["Name", "Position", "TeamAbbrev"]])
-
-# ---------- INIT SESSION STATE ----------
-if "forced_players" not in st.session_state:
-    st.session_state.forced_players = {}          # {player_name: min_lineups}
-if "caps" not in st.session_state:
-    st.session_state.caps = {}                    # {player_name: max_lineups}
-if "forced_pairs" not in st.session_state:
-    st.session_state.forced_pairs = {}            # {(main_name, sec_name): count}
-if "pair_requires_main" not in st.session_state:
-    st.session_state.pair_requires_main = {}      # {(main_name, sec_name): bool}
 
 player_list_sorted = sorted(players["Name"].unique())
 
