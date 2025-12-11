@@ -7,9 +7,9 @@ from io import BytesIO
 # SESSION STATE INIT
 # =============================================
 if "forced_players" not in st.session_state:
-    st.session_state.forced_players = {}
+    st.session_state.forced_players = {}   # {player_name: min_lineups}
 if "caps" not in st.session_state:
-    st.session_state.caps = {}
+    st.session_state.caps = {}             # {player_name: max_lineups}
 if "pairs_df" not in st.session_state:
     st.session_state.pairs_df = pd.DataFrame(
         columns=[
@@ -26,12 +26,13 @@ if "pairs_df" not in st.session_state:
 # =============================================
 PROJECTION_COL_DEFAULT = "FP_P75"
 
+
 # =============================================
 # CORE HELPER / OPTIMIZER LOGIC
 # =============================================
 
 def parse_opponent(gameinfo, team):
-    """Extract opponent from DK GameInfo."""
+    """Extract opponent team from DK 'Game Info' column."""
     if not isinstance(gameinfo, str):
         return None
     parts = gameinfo.split()
@@ -40,31 +41,41 @@ def parse_opponent(gameinfo, team):
         return None
     try:
         t1, t2 = token.split("@")
+        t1 = t1.strip()
+        t2 = t2.strip()
     except ValueError:
         return None
-    return t2 if team == t1 else (t1 if team == t2 else None)
+    if team == t1:
+        return t2
+    if team == t2:
+        return t1
+    return None
+
 
 def load_and_prepare_data(proj_file, sal_file, proj_col):
     """
-    Load projections + DK salaries and merge.
+    Load projections (Excel) and DK salaries (CSV), merge them,
+    compute ProjPoints, Salary, Opponent.
     Returns:
-        players          merged DK+projections
-        unmatched_dk     DK rows missing projections
-        unmatched_proj   projection rows missing DK
-        proj_full        full raw projection file for filtering
+        players         - merged DK + projections
+        unmatched_dk    - DK rows without matching projection
+        unmatched_proj  - projection rows without matching DK
+        proj_full       - full projections dataframe (for explorer)
     """
     proj_full = pd.read_excel(proj_file)
     dk = pd.read_csv(sal_file)
+
     proj = proj_full.copy()
 
-    # Clean text
+    # Clean text fields
     for df in (proj, dk):
         for col in ["Name", "Position", "TeamAbbrev"]:
             if col in df.columns:
-                df[col] = df[col].astype(str).strip()
+                df[col] = df[col].astype(str).str.strip()
 
     merge_cols = ["Name", "Position", "TeamAbbrev"]
 
+    # Merge
     players = dk.merge(
         proj[merge_cols + [proj_col]],
         on=merge_cols,
@@ -79,7 +90,7 @@ def load_and_prepare_data(proj_file, sal_file, proj_col):
 
     players = players.drop(columns=["_merge"])
 
-    # Projection (DST fallback)
+    # Unified projection (DST uses AvgPointsPerGame if projection missing)
     def project(r):
         if r["Position"] == "DST":
             return r.get("AvgPointsPerGame", None)
@@ -91,6 +102,7 @@ def load_and_prepare_data(proj_file, sal_file, proj_col):
     players["Salary"] = pd.to_numeric(players["Salary"], errors="coerce")
     players = players.dropna(subset=["Salary"])
 
+    # Opponent extraction for RB/QB vs DST rule
     if "Game Info" in players.columns:
         players["Opponent"] = players.apply(
             lambda r: parse_opponent(r["Game Info"], r["TeamAbbrev"]),
@@ -99,159 +111,13 @@ def load_and_prepare_data(proj_file, sal_file, proj_col):
     else:
         players["Opponent"] = None
 
-    # Remove duplicates
+    # ----------- REMOVE DUPLICATE PLAYERS -----------
     players = players.sort_values("Salary", ascending=False)
     players = players.drop_duplicates(subset=["Name", "Position", "TeamAbbrev"], keep="first")
     players = players.reset_index(drop=True)
 
     return players, unmatched_dk, unmatched_proj, proj_full
 
-
-# =============================================
-# STREAMLIT APP — START
-# =============================================
-
-st.set_page_config(page_title="DFS Lineup Optimizer", layout="wide")
-st.title("DFS Lineup Optimizer 🏈")
-
-st.markdown("Use projections + DK salaries to generate MILP-optimized lineups with exposures, stacks, filters, and more.")
-
-# ============================
-# Sidebar – File Uploads
-# ============================
-with st.sidebar:
-    st.header("Step 1: Upload Files")
-    proj_file = st.file_uploader("Projection Excel (.xlsx)", type=["xlsx"])
-    salary_file = st.file_uploader("DK Salaries CSV (.csv)", type=["csv"])
-
-    st.header("Step 2: Global Settings")
-    NUM_LINEUPS = st.number_input("Number of Lineups", 1, 150, 20)
-    SALARY_CAP = st.number_input("Salary Cap", 20000, 100000, 50000, step=500)
-    MIN_UNIQUE_PLAYERS = st.number_input("Min Unique Players vs Previous", 1, 9, 2)
-    min_non_dst_salary = st.number_input("Min Non-DST Salary", 0, 20000, 0)
-
-    st.markdown("---")
-    st.subheader("FLEX Eligibility")
-    flex_allowed = {
-        "RB": st.checkbox("RB in FLEX", True),
-        "WR": st.checkbox("WR in FLEX", True),
-        "TE": st.checkbox("TE in FLEX", True),
-    }
-
-# Require upload
-if proj_file is None or salary_file is None:
-    st.info("⬅️ Please upload both **projections** and **DK salaries** to begin.")
-    st.stop()
-
-# =============================================
-# Load & Merge Data
-# =============================================
-st.header("Data & Projection Setup")
-
-preview = pd.read_excel(proj_file, nrows=5)
-st.subheader("Projection File Preview (first 5 rows)")
-st.dataframe(preview, use_container_width=True)
-
-proj_cols = [c for c in preview.columns if c not in ["Name", "Position", "TeamAbbrev", "Team", "Opp"]]
-if not proj_cols:
-    st.error("No projection columns found in file.")
-    st.stop()
-
-PROJECTION_COL = st.selectbox("Projection Column", proj_cols)
-
-with st.spinner("Merging projections with DK salaries..."):
-    players, unmatched_dk, unmatched_proj, proj_full = load_and_prepare_data(
-        proj_file, salary_file, PROJECTION_COL
-    )
-
-st.success(f"Loaded {len(players)} players into the model.")
-
-# =============================================
-# Matched / Unmatched Players
-# =============================================
-
-left, right = st.columns(2)
-with left:
-    st.subheader("Merged Player Data (first 20 rows)")
-    st.dataframe(players.head(20), use_container_width=True)
-
-with right:
-    with st.expander("Unmatched DK Salary Players"):
-        if unmatched_dk.empty:
-            st.write("✅ All DK players matched projection data.")
-        else:
-            st.dataframe(unmatched_dk[["Name", "Position", "TeamAbbrev"]], use_container_width=True)
-
-    with st.expander("Unmatched Projection Players"):
-        if unmatched_proj.empty:
-            st.write("✅ All projection players matched DK salaries.")
-        else:
-            st.dataframe(unmatched_proj[["Name", "Position", "TeamAbbrev"]], use_container_width=True)
-
-# =============================================
-# Projection Explorer — FULL FILTERING + SORTING
-# =============================================
-
-st.header("Projection File Explorer (Filter + Sort + Search)")
-
-proj_view = proj_full.copy()
-
-# =========================
-# Filters
-# =========================
-f1, f2, f3 = st.columns(3)
-
-with f1:
-    pos_opts = sorted(proj_view["Position"].dropna().unique()) if "Position" in proj_view else []
-    pos_filter = st.multiselect("Filter by Position", pos_opts, default=pos_opts)
-
-with f2:
-    team_col = "TeamAbbrev" if "TeamAbbrev" in proj_view.columns else ("Team" if "Team" in proj_view.columns else None)
-    if team_col:
-        team_opts = sorted(proj_view[team_col].dropna().unique())
-        team_filter = st.multiselect("Filter by Team", team_opts, default=team_opts)
-    else:
-        team_filter = []
-
-with f3:
-    name_search = st.text_input("Search Name (contains)")
-
-# Apply filters
-if pos_filter:
-    proj_view = proj_view[proj_view["Position"].isin(pos_filter)]
-
-if team_filter:
-    proj_view = proj_view[proj_view[team_col].isin(team_filter)]
-
-if name_search:
-    proj_view = proj_view[proj_view["Name"].str.contains(name_search, case=False, na=False)]
-
-# =============================================
-# SORTING CONTROLS — OPTION A
-# =============================================
-sort_col = st.selectbox("Sort by Column", proj_view.columns)
-sort_dir = st.radio("Sort Direction", ["Ascending", "Descending"], horizontal=True)
-
-proj_view = proj_view.sort_values(
-    by=sort_col,
-    ascending=(sort_dir == "Ascending")
-)
-
-# Show final filtered/sorted projection data
-st.data_editor(
-    proj_view,
-    use_container_width=True,
-    num_rows="dynamic",
-    key="proj_explorer_editor"
-)
-
-# =============================================
-# STORE PLAYER LIST
-# =============================================
-player_list_sorted = sorted(players["Name"].unique())
-# =============================================
-# OPTIMIZER CORE FUNCTIONS
-# =============================================
 
 def build_one_lineup(players,
                      prev_lineups,
@@ -286,7 +152,7 @@ def build_one_lineup(players,
 
     TOTAL = 9
 
-    # Objective: maximize projected points
+    # Objective
     prob += pulp.lpSum(players.loc[i, "ProjPoints"] * x[i] for i in candidate_ids)
 
     # Salary cap & total players
@@ -306,6 +172,8 @@ def build_one_lineup(players,
     prob += QB == 1
     prob += DST == 1
     prob += RB + WR + TE == 7
+
+    # Baseline skill requirements
     prob += RB >= 2
     prob += WR >= 3
     prob += TE >= 1
@@ -321,7 +189,7 @@ def build_one_lineup(players,
         if remain > 0 and pid in candidate_ids:
             prob += x[pid] == 1
 
-    # Group constraints: all members in a row must appear together
+    # GROUP constraints: all members in a row must appear together
     for group in forced_groups:
         if group["remain"] <= 0:
             continue
@@ -356,7 +224,7 @@ def build_one_lineup(players,
             if opp == dst_team:
                 prob += x[pid] + x[dst_id] <= 1
 
-    # FLEX constraints
+    # EXPLICIT FLEX SLOT
     flex_positions = ["RB", "WR", "TE"]
     flex_pool = [i for i in candidate_ids if players.loc[i, "Position"] in flex_positions]
     flex_x = pulp.LpVariable.dicts("flex", flex_pool, 0, 1, pulp.LpBinary)
@@ -364,13 +232,16 @@ def build_one_lineup(players,
     for i in flex_pool:
         prob += flex_x[i] <= x[i]
 
+    # Exactly one FLEX slot
     prob += pulp.lpSum(flex_x[i] for i in flex_pool) == 1
 
+    # Enforce which positions allowed in FLEX
     for i in flex_pool:
         pos = players.loc[i, "Position"]
         if not flex_allowed[pos]:
             prob += flex_x[i] == 0
 
+    # Baseline counts excluding FLEX player
     RB_base = RB - pulp.lpSum(flex_x[i] for i in flex_pool if players.loc[i, "Position"] == "RB")
     WR_base = WR - pulp.lpSum(flex_x[i] for i in flex_pool if players.loc[i, "Position"] == "WR")
     TE_base = TE - pulp.lpSum(flex_x[i] for i in flex_pool if players.loc[i, "Position"] == "TE")
@@ -394,11 +265,14 @@ def build_one_lineup(players,
     return players.loc[chosen].copy(), flex_idx
 
 
+# ---------- SLOT ASSIGNMENT (NO DUPLICATES IN DISPLAY) ----------
+
 def assign_slots(lu, flex_idx, players):
     """
-    Map chosen players into DK slots:
-      QB, RB1, RB2, WR1, WR2, WR3, TE, FLEX, DST
-    with no visual duplicates.
+    Returns a dict:
+        { "QB": idx, "RB1": idx, "RB2": idx,
+          "WR1": idx, "WR2": idx, "WR3": idx,
+          "TE": idx, "FLEX": idx, "DST": idx }
     """
     remaining = set(lu.index)
     slot_map = {}
@@ -415,11 +289,11 @@ def assign_slots(lu, flex_idx, players):
     slot_map["DST"] = dst
     remaining.discard(dst)
 
-    # Make sure FLEX isn't double-used as RB/WR/TE
+    # Remove FLEX from remaining so we don't assign it to RB/WR/TE too
     if flex_idx in remaining:
         remaining.discard(flex_idx)
 
-    # RBs — highest salary = RB1, next = RB2
+    # RBs
     rb_list = [i for i in remaining if lu.loc[i, "Position"] == "RB"]
     rb_list_sorted = sorted(rb_list, key=lambda i: players.loc[i, "Salary"], reverse=True)
     while len(rb_list_sorted) < 2:
@@ -433,7 +307,7 @@ def assign_slots(lu, flex_idx, players):
     if rb_list_sorted[1] is not None:
         remaining.discard(rb_list_sorted[1])
 
-    # WRs — highest salary = WR1, next = WR2, next = WR3
+    # WRs
     wr_list = [i for i in remaining if lu.loc[i, "Position"] == "WR"]
     wr_list_sorted = sorted(wr_list, key=lambda i: players.loc[i, "Salary"], reverse=True)
     while len(wr_list_sorted) < 3:
@@ -465,8 +339,8 @@ def assign_slots(lu, flex_idx, players):
 
 def restructure_lineup_for_export(lu, flex_idx, players, name_id_col):
     """
-    Build a dict for CSV export, with columns:
-    QB, RB1, RB2, WR1, WR2, WR3, TE, FLEX, DST, Total_Salary
+    Build a dict with DK slots keyed by slot name, using Name+ID column.
+    DST is exported last, after FLEX.
     """
     slot_map = assign_slots(lu, flex_idx, players)
 
@@ -476,7 +350,7 @@ def restructure_lineup_for_export(lu, flex_idx, players, name_id_col):
         "WR1", "WR2", "WR3",
         "TE",
         "FLEX",
-        "DST",  # DST last, after FLEX
+        "DST",   # <-- last, after FLEX
     ]
 
     rec = {}
@@ -484,13 +358,13 @@ def restructure_lineup_for_export(lu, flex_idx, players, name_id_col):
 
     for slot in EXPORT_SLOT_ORDER:
         pid = slot_map[slot]
-        row = players.loc[pid]
+        player_row = players.loc[pid]
         if name_id_col:
-            name_id = row[name_id_col]
+            name_id = player_row[name_id_col]
         else:
-            name_id = f"{row['Name']}_{pid}"
+            name_id = f"{player_row['Name']}_{pid}"
         rec[slot] = name_id
-        total_salary += int(row["Salary"])
+        total_salary += int(player_row["Salary"])
 
     rec["Total_Salary"] = total_salary
     return rec
@@ -498,26 +372,146 @@ def restructure_lineup_for_export(lu, flex_idx, players, name_id_col):
 
 def build_display_lineup(lu, flex_idx, players):
     """
-    DataFrame for UI display in slot order with:
-    Slot, Name, Team, Salary, Proj
+    Build a DataFrame in QB, RB1, RB2, WR1, WR2, WR3, TE, FLEX, DST order
+    for on-screen display (using Name, Team, Salary, Proj).
     """
     slot_map = assign_slots(lu, flex_idx, players)
     rows = []
     for slot in ["QB", "RB1", "RB2", "WR1", "WR2", "WR3", "TE", "FLEX", "DST"]:
         pid = slot_map[slot]
-        row = players.loc[pid]
+        pl = players.loc[pid]
         rows.append({
             "Slot": slot,
-            "Name": row["Name"],
-            "Team": row.get("TeamAbbrev", ""),
-            "Salary": int(row["Salary"]),
-            "Proj": round(float(row["ProjPoints"]), 2),
+            "Name": pl["Name"],
+            "Team": pl.get("TeamAbbrev", ""),
+            "Salary": int(pl["Salary"]),
+            "Proj": round(float(pl["ProjPoints"]), 2),
         })
     return pd.DataFrame(rows)
 
 
 # =============================================
-# EXPOSURES & CONSTRAINTS UI
+# STREAMLIT APP
+# =============================================
+
+st.set_page_config(page_title="DFS Lineup Optimizer", layout="wide")
+
+st.title("DFS Lineup Optimizer 🏈")
+st.markdown(
+    "Upload your **projections** and **DraftKings salary CSV**, configure rules, "
+    "and generate optimized lineups with exposures and constraints."
+)
+
+# ---------- SIDEBAR: FILES + GLOBAL SETTINGS ----------
+with st.sidebar:
+    st.header("Step 1: Upload Files")
+    proj_file = st.file_uploader("Projection Excel (.xlsx)", type=["xlsx"])
+    salary_file = st.file_uploader("DK Salaries CSV (.csv)", type=["csv"])
+
+    st.header("Step 2: Global Settings")
+    NUM_LINEUPS = int(st.number_input("Number of Lineups", 1, 150, 20))
+    SALARY_CAP = int(st.number_input("Salary Cap", 20000, 100000, 50000, step=500))
+    MIN_UNIQUE_PLAYERS = int(st.number_input("Min Unique Players vs Previous", 1, 9, 2))
+    min_non_dst_salary = int(
+        st.number_input("Min Salary for NON-DST players", 0, 20000, 0, step=500)
+    )
+
+    st.markdown("---")
+    st.subheader("FLEX Eligibility")
+    flex_rb = st.checkbox("Allow RB in FLEX", value=True)
+    flex_wr = st.checkbox("Allow WR in FLEX", value=True)
+    flex_te = st.checkbox("Allow TE in FLEX", value=True)
+
+    flex_allowed = {"RB": flex_rb, "WR": flex_wr, "TE": flex_te}
+
+# ---------- REQUIRE UPLOADS ----------
+if proj_file is None or salary_file is None:
+    st.info("⬅️ Upload your projections and DK salaries in the sidebar to begin.")
+    st.stop()
+
+# ---------- LOAD DATA ----------
+st.header("Data & Projection Setup")
+
+proj_preview = pd.read_excel(proj_file, nrows=5)
+st.subheader("Projection File Preview (first 5 rows)")
+st.dataframe(proj_preview)
+
+proj_cols = [c for c in proj_preview.columns if c not in ["Name", "Position", "TeamAbbrev", "Team", "Opp"]]
+if not proj_cols:
+    st.error("No projection columns found. Make sure your file has at least one numeric projection column.")
+    st.stop()
+
+default_proj_col = PROJECTION_COL_DEFAULT if PROJECTION_COL_DEFAULT in proj_cols else proj_cols[0]
+PROJECTION_COL = st.selectbox("Projection Column to Use", proj_cols, index=proj_cols.index(default_proj_col))
+
+with st.spinner("Merging projections with salaries..."):
+    players, unmatched_dk, unmatched_proj, proj_full = load_and_prepare_data(proj_file, salary_file, PROJECTION_COL)
+
+st.success(f"Loaded {len(players)} players with salaries and projections.")
+
+# ---------- MATCHED / UNMATCHED & MERGED VIEW ----------
+col1, col2 = st.columns(2)
+with col1:
+    st.subheader("Merged Player Data Preview")
+    st.dataframe(players.head(20), use_container_width=True)
+
+with col2:
+    with st.expander("Unmatched DK Salary Players (in DK but not in projections)"):
+        if unmatched_dk.empty:
+            st.write("✅ All DK players matched projection data.")
+        else:
+            st.dataframe(unmatched_dk[["Name", "Position", "TeamAbbrev"]], use_container_width=True)
+
+    with st.expander("Unmatched Projection Players (in projections but not in DK)"):
+        if unmatched_proj.empty:
+            st.write("✅ All projection players matched DK salaries.")
+        else:
+            st.dataframe(unmatched_proj[["Name", "Position", "TeamAbbrev"]], use_container_width=True)
+
+# ---------- PROJECTION FILE EXPLORER (FILTERABLE) ----------
+st.header("Projection File Explorer (Filterable)")
+
+proj_view = proj_full.copy()
+
+# Basic filter controls
+fcol1, fcol2, fcol3 = st.columns(3)
+with fcol1:
+    pos_opts = sorted([p for p in proj_view["Position"].dropna().unique()]) if "Position" in proj_view.columns else []
+    pos_filter = st.multiselect("Filter Position", pos_opts, default=pos_opts)
+
+with fcol2:
+    team_col = "TeamAbbrev" if "TeamAbbrev" in proj_view.columns else ("Team" if "Team" in proj_view.columns else None)
+    if team_col:
+        team_opts = sorted([t for t in proj_view[team_col].dropna().unique()])
+        team_filter = st.multiselect("Filter Team", team_opts, default=team_opts)
+    else:
+        team_filter = []
+
+with fcol3:
+    name_search = st.text_input("Search Player Name (contains)", value="")
+
+# Apply filters
+if pos_filter and "Position" in proj_view.columns:
+    proj_view = proj_view[proj_view["Position"].isin(pos_filter)]
+
+if team_filter and ("TeamAbbrev" in proj_view.columns or "Team" in proj_view.columns):
+    proj_view = proj_view[proj_view[team_col].isin(team_filter)]
+
+if name_search:
+    proj_view = proj_view[proj_view["Name"].str.contains(name_search, case=False, na=False)]
+
+# Show filterable table (Excel-like sorting/filtering in UI)
+st.data_editor(
+    proj_view,
+    use_container_width=True,
+    num_rows="dynamic",
+    key="proj_explorer_editor"
+)
+
+player_list_sorted = sorted(players["Name"].unique())
+
+# =============================================
+# EXPOSURES & CONSTRAINTS
 # =============================================
 
 st.header("Exposures & Constraints")
@@ -636,16 +630,15 @@ with st.expander("Forced Groups (Stacks / Correlations)", expanded=False):
     )
 
     st.session_state.pairs_df = pairs_df
+
 # =============================================
-# RUN OPTIMIZER & OUTPUTS
+# RUN OPTIMIZER
 # =============================================
 
 run_button = st.button("🚀 Generate Lineups")
 
 if run_button:
     with st.spinner("🔄 Solving optimization model and generating lineups..."):
-
-        # Map player names to indices
         name_to_idx = (
             players.reset_index()
                    .set_index("Name")["index"]
@@ -658,7 +651,7 @@ if run_button:
             if name not in name_to_idx:
                 st.warning(f"Forced exposure: player '{name}' not found in merged data.")
                 continue
-            forced_players_idx[name_to_idx[name]] = max(0, min(int(cnt), int(NUM_LINEUPS)))
+            forced_players_idx[name_to_idx[name]] = max(0, min(cnt, NUM_LINEUPS))
 
         # Caps → index-based dict
         per_player_caps_idx = {}
@@ -666,7 +659,7 @@ if run_button:
             if name not in name_to_idx:
                 st.warning(f"Cap: player '{name}' not found in merged data.")
                 continue
-            per_player_caps_idx[name_to_idx[name]] = max(0, min(int(cnt), int(NUM_LINEUPS)))
+            per_player_caps_idx[name_to_idx[name]] = max(0, min(cnt, NUM_LINEUPS))
 
         # Groups → index-based structures
         forced_groups = []          # list of {"members": [idx,...], "remain": together}
@@ -721,29 +714,26 @@ if run_button:
                     "remain": together,
                 })
 
-        # Track usage
         used_counts = {i: 0 for i in players.index}
 
         # Build max exposure per player
         max_allowed = {}
         for i in players.index:
             forced_min = forced_players_idx.get(i, 0)
-            cap = per_player_caps_idx.get(i, int(NUM_LINEUPS))
+            cap = per_player_caps_idx.get(i, NUM_LINEUPS)
             max_allowed[i] = max(cap, forced_min)
 
         all_lineups = []
         prev_lineups = []
         flex_indices = []
 
-        # Mutable copies for iteration
         forced_players_iter = forced_players_idx.copy()
         forced_groups_iter = [
             {"members": g["members"][:], "remain": g["remain"]}
             for g in forced_groups
         ]
 
-        # Build lineups
-        for k in range(int(NUM_LINEUPS)):
+        for k in range(NUM_LINEUPS):
             lu, flex_idx = build_one_lineup(
                 players,
                 prev_lineups,
@@ -754,8 +744,8 @@ if run_button:
                 used_counts,
                 flex_allowed,
                 int(min_non_dst_salary),
-                int(SALARY_CAP),
-                int(MIN_UNIQUE_PLAYERS)
+                SALARY_CAP,
+                MIN_UNIQUE_PLAYERS
             )
 
             if lu is None:
@@ -781,24 +771,18 @@ if run_button:
                     group["remain"] -= 1
 
     # =============================================
-    # AFTER SOLVE: EXPOSURES + LINEUPS + CSV
+    # EXPOSURE SUMMARY
     # =============================================
-    if not run_button:
-        st.stop()
-
     if not all_lineups:
         st.error("No lineups generated.")
     else:
-        # ---------- Exposure Summary ----------
         st.header("Exposure Summary")
 
         exposure_rows = []
-        num_built = len(all_lineups)
-
         for idx in players.index:
             count = used_counts[idx]
             if count == 0:
-                continue
+                continue  # skip players never used
             row = players.loc[idx]
             exposure_rows.append({
                 "Name": row["Name"],
@@ -806,8 +790,8 @@ if run_button:
                 "Team": row.get("TeamAbbrev", ""),
                 "Salary": int(row["Salary"]),
                 "Proj": round(float(row["ProjPoints"]), 2),
-                "Lineups Used": int(count),
-                "Exposure %": round(100 * count / num_built, 1),
+                "Lineups Used": count,
+                "Exposure %": round(100 * count / len(all_lineups), 1)
             })
 
         if exposure_rows:
@@ -815,9 +799,11 @@ if run_button:
             exposure_df = exposure_df.sort_values("Exposure %", ascending=False)
             st.dataframe(exposure_df, use_container_width=True)
         else:
-            st.write("No players used in any lineups.")
+            st.write("No players used in any lineups (this should only happen if no lineups were built).")
 
-        # ---------- Show Lineups ----------
+        # =============================================
+        # SHOW LINEUPS
+        # =============================================
         st.success(f"Generated {len(all_lineups)} lineups.")
 
         for i, (lu, fidx) in enumerate(zip(all_lineups, flex_indices), start=1):
@@ -834,7 +820,9 @@ if run_button:
             display_df = build_display_lineup(lu, fidx, players)
             st.dataframe(display_df, use_container_width=True)
 
-        # ---------- CSV Export ----------
+        # =============================================
+        # CSV EXPORT
+        # =============================================
         if "Name + ID" in players.columns:
             name_id_col = "Name + ID"
         elif "Name+ID" in players.columns:
@@ -849,13 +837,10 @@ if run_button:
             rows.append(rec)
 
         export_df = pd.DataFrame(rows)
-
-        st.subheader("Download Lineups CSV (DST is last column)")
+        st.subheader("Download CSV (DST is last column)")
         st.dataframe(export_df.head(), use_container_width=True)
-
         buf = BytesIO()
         export_df.to_csv(buf, index=False)
-
         st.download_button(
             "Download Lineups CSV",
             data=buf.getvalue(),
