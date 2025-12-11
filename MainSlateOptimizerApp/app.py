@@ -4,16 +4,16 @@ import streamlit as st
 from io import BytesIO
 
 # =============================================
-# SESSION STATE INIT (MUST BE AT THE TOP)
+# SESSION STATE INIT (AT TOP)
 # =============================================
 if "forced_players" not in st.session_state:
-    st.session_state.forced_players = {}          # {player_name: min_lineups}
+    st.session_state.forced_players = {}      # {player_name: min_lineups}
 if "caps" not in st.session_state:
-    st.session_state.caps = {}                    # {player_name: max_lineups}
-if "forced_pairs" not in st.session_state:
-    st.session_state.forced_pairs = {}            # {(main_name, sec_name): count}
-if "pair_requires_main" not in st.session_state:
-    st.session_state.pair_requires_main = {}      # {(main_name, sec_name): bool}
+    st.session_state.caps = {}                # {player_name: max_lineups}
+if "pairs_df" not in st.session_state:
+    st.session_state.pairs_df = pd.DataFrame(
+        columns=["Main", "Secondary", "Together", "RequireMain"]
+    )
 
 # =============================================
 # GLOBAL DEFAULTS
@@ -50,9 +50,6 @@ def load_and_prepare_data(proj_file, sal_file, proj_col):
     """
     Load projections (Excel) and DK salaries (CSV), merge them, and compute
     a unified 'ProjPoints' column plus Opponent extraction.
-
-    Returns:
-      players_df, unmatched_dk_df, unmatched_proj_df
     """
     proj = pd.read_excel(proj_file)
     dk = pd.read_csv(sal_file)
@@ -294,7 +291,6 @@ def restructure_lineup_for_export(lu, flex_idx, players, name_id_col):
         if name_id_col is not None:
             name_id = player_row[name_id_col]
         else:
-            # Fallback if Name+ID column doesn't exist
             name_id = f"{player_row['Name']}_{pid}"
 
         rec[slot] = name_id
@@ -381,156 +377,133 @@ with col2:
 
 player_list_sorted = sorted(players["Name"].unique())
 
-# ---------- EXPOSURES & CONSTRAINTS ----------
+# =============================================
+# EXPOSURES & CONSTRAINTS
+# =============================================
+
 st.header("Exposures & Constraints")
 
-# ----- Forced Minimum Exposures -----
-with st.expander("Forced Minimum Lineups (Required Appearances)", expanded=True):
-    forced_players = st.session_state.forced_players
+# ----- Forced Minimum Exposures (multiselect + per-player inputs) -----
+with st.expander("Forced Minimum Lineups", expanded=True):
+    st.markdown("Select players you want to **force** into at least N lineups.")
 
-    c1, c2, c3 = st.columns([3, 1.5, 1.5])
-    with c1:
-        forced_name = st.selectbox(
-            "Select player to FORCE",
-            [""] + player_list_sorted,
-            key="forced_name_select",
-            help="Player will be forced into at least this many lineups."
-        )
-    with c2:
-        forced_count = st.number_input(
-            "Minimum lineups",
-            0, NUM_LINEUPS, 0,
-            key="forced_count_input"
-        )
-    with c3:
-        if st.button("Add / Update Forced Player", key="forced_add_btn"):
-            if forced_name != "":
-                st.session_state.forced_players[forced_name] = forced_count
+    # Multiselect with current keys as default
+    forced_selected = st.multiselect(
+        "Players to force",
+        player_list_sorted,
+        default=list(st.session_state.forced_players.keys()),
+        key="forced_multiselect"
+    )
 
-    if forced_players:
-        st.markdown("**Current Forced Players**")
-        df_forced = pd.DataFrame(
-            [{"Player": name, "Min Lineups": cnt}
-             for name, cnt in forced_players.items()]
+    new_forced = {}
+    for name in forced_selected:
+        default_val = st.session_state.forced_players.get(name, 0)
+        cnt = st.number_input(
+            f"Min lineups for {name}",
+            0, NUM_LINEUPS,
+            value=int(default_val),
+            key=f"forced_cnt_{name}"
         )
-        st.table(df_forced)
+        new_forced[name] = int(cnt)
 
-        rm_name = st.selectbox(
-            "Remove a forced player (optional)",
-            [""] + list(forced_players.keys()),
-            key="forced_remove_select"
-        )
-        if st.button("Remove Forced Player", key="forced_remove_btn"):
-            if rm_name in st.session_state.forced_players:
-                del st.session_state.forced_players[rm_name]
+    # Update session state to match UI
+    st.session_state.forced_players = new_forced
 
-# ----- Max Caps -----
+    if new_forced:
+        st.subheader("Current Forced Players")
+        st.table(pd.DataFrame(
+            [{"Player": n, "Min Lineups": c} for n, c in new_forced.items()]
+        ))
+
+# ----- Max Caps (multiselect + per-player inputs) -----
 with st.expander("Max Lineups Per Player (Caps)", expanded=False):
-    caps = st.session_state.caps
+    st.markdown("Select players you want to **cap** at a maximum number of lineups.")
 
-    c1, c2, c3 = st.columns([3, 1.5, 1.5])
-    with c1:
-        cap_name = st.selectbox(
-            "Select player to CAP",
-            [""] + player_list_sorted,
-            key="cap_name_select",
-            help="Player will appear in at most this many lineups."
-        )
-    with c2:
-        cap_count = st.number_input(
-            "Max lineups",
-            0, NUM_LINEUPS, NUM_LINEUPS,
-            key="cap_count_input"
-        )
-    with c3:
-        if st.button("Add / Update Cap", key="cap_add_btn"):
-            if cap_name != "":
-                st.session_state.caps[cap_name] = cap_count
+    caps_selected = st.multiselect(
+        "Players to cap",
+        player_list_sorted,
+        default=list(st.session_state.caps.keys()),
+        key="caps_multiselect"
+    )
 
-    if caps:
-        st.markdown("**Current Caps**")
-        df_caps = pd.DataFrame(
-            [{"Player": name, "Max Lineups": cnt}
-             for name, cnt in caps.items()]
+    new_caps = {}
+    for name in caps_selected:
+        default_val = st.session_state.caps.get(name, NUM_LINEUPS)
+        cnt = st.number_input(
+            f"Max lineups for {name}",
+            0, NUM_LINEUPS,
+            value=int(default_val),
+            key=f"cap_cnt_{name}"
         )
-        st.table(df_caps)
+        new_caps[name] = int(cnt)
 
-        rm_cap_name = st.selectbox(
-            "Remove a cap (optional)",
-            [""] + list(caps.keys()),
-            key="cap_remove_select"
-        )
-        if st.button("Remove Cap", key="cap_remove_btn"):
-            if rm_cap_name in st.session_state.caps:
-                del st.session_state.caps[rm_cap_name]
+    st.session_state.caps = new_caps
 
-# ----- Forced Pairs -----
+    if new_caps:
+        st.subheader("Current Caps")
+        st.table(pd.DataFrame(
+            [{"Player": n, "Max Lineups": c} for n, c in new_caps.items()]
+        ))
+
+# ----- Forced Pairs (data editor table) -----
 with st.expander("Forced Pairs (Stacks / Correlations)", expanded=False):
-    forced_pairs = st.session_state.forced_pairs
-    pair_requires_main = st.session_state.pair_requires_main
+    st.markdown(
+        "Each row defines a pair:\n"
+        "- **Main** and **Secondary** players\n"
+        "- **Together** = lineups they must appear together\n"
+        "- **RequireMain** = Secondary cannot appear without Main"
+    )
 
-    c1, c2 = st.columns(2)
-    with c1:
-        pair_main = st.selectbox(
-            "Main Player",
-            [""] + player_list_sorted,
-            key="pair_main_select"
-        )
-    with c2:
-        pair_secondary = st.selectbox(
-            "Secondary Player",
-            [""] + player_list_sorted,
-            key="pair_secondary_select"
+    base_df = st.session_state.pairs_df.copy()
+    if base_df.empty:
+        base_df = pd.DataFrame(
+            [{"Main": "", "Secondary": "", "Together": 0, "RequireMain": False}]
         )
 
-    c3, c4, c5 = st.columns([1.5, 2, 2])
-    with c3:
-        pair_count = st.number_input(
-            "Lineups together",
-            0, NUM_LINEUPS, 0,
-            key="pair_count_input",
-            help="Number of lineups where these two players MUST appear together."
-        )
-    with c4:
-        pair_require = st.checkbox(
-            "Secondary CANNOT appear without Main",
-            key="pair_require_checkbox",
-            help="If checked, the secondary player may only appear in lineups where the main player is also present."
-        )
-    with c5:
-        if st.button("Add / Update Pair", key="pair_add_btn"):
-            if pair_main and pair_secondary and pair_main != pair_secondary:
-                key_pair = (pair_main, pair_secondary)
-                st.session_state.forced_pairs[key_pair] = pair_count
-                st.session_state.pair_requires_main[key_pair] = pair_require
+    pairs_df = st.data_editor(
+        base_df,
+        num_rows="dynamic",
+        key="pairs_editor",
+        column_config={
+            "Main": st.column_config.SelectboxColumn(
+                "Main", options=[""] + player_list_sorted
+            ),
+            "Secondary": st.column_config.SelectboxColumn(
+                "Secondary", options=[""] + player_list_sorted
+            ),
+            "Together": st.column_config.NumberColumn(
+                "Lineups together", min_value=0, max_value=NUM_LINEUPS, step=1
+            ),
+            "RequireMain": st.column_config.CheckboxColumn("Secondary requires main?"),
+        }
+    )
 
-    if forced_pairs:
-        st.markdown("**Current Forced Pairs**")
-        df_pairs = []
-        for (m, s), cnt in forced_pairs.items():
-            df_pairs.append({
-                "Main": m,
-                "Secondary": s,
-                "Lineups Together": cnt,
-                "Secondary Requires Main?": pair_requires_main.get((m, s), False)
-            })
-        st.table(pd.DataFrame(df_pairs))
+    # Save cleaned version back to session_state
+    st.session_state.pairs_df = pairs_df
 
-        all_pair_labels = [f"{m} + {s}" for (m, s) in forced_pairs.keys()]
-        rm_pair_label = st.selectbox(
-            "Remove a pair (optional)",
-            [""] + all_pair_labels,
-            key="pair_remove_select"
-        )
-        if st.button("Remove Pair", key="pair_remove_btn"):
-            if rm_pair_label != "":
-                idx = all_pair_labels.index(rm_pair_label)
-                key_to_remove = list(forced_pairs.keys())[idx]
-                del st.session_state.forced_pairs[key_to_remove]
-                if key_to_remove in st.session_state.pair_requires_main:
-                    del st.session_state.pair_requires_main[key_to_remove]
+    # Show a filtered view of valid rows
+    valid_rows = []
+    for _, row in pairs_df.iterrows():
+        m = row.get("Main")
+        s = row.get("Secondary")
+        t = int(row.get("Together") or 0)
+        if not m or not s or m == s or t <= 0:
+            continue
+        valid_rows.append({
+            "Main": m,
+            "Secondary": s,
+            "Together": t,
+            "RequireMain": bool(row.get("RequireMain"))
+        })
 
-# ---------- RUN OPTIMIZER ----------
+    if valid_rows:
+        st.subheader("Current Forced Pairs")
+        st.table(pd.DataFrame(valid_rows))
+
+# =============================================
+# RUN OPTIMIZER
+# =============================================
+
 run_button = st.button("🚀 Generate Lineups")
 
 if run_button:
@@ -541,7 +514,7 @@ if run_button:
                    .to_dict()
         )
 
-        # Convert forced exposures to index-based dict
+        # Forced players → index-based dict
         forced_players_idx = {}
         for name, cnt in st.session_state.forced_players.items():
             if name not in name_to_idx:
@@ -549,7 +522,7 @@ if run_button:
                 continue
             forced_players_idx[name_to_idx[name]] = max(0, min(cnt, NUM_LINEUPS))
 
-        # Caps
+        # Caps → index-based dict
         per_player_caps_idx = {}
         for name, cnt in st.session_state.caps.items():
             if name not in name_to_idx:
@@ -557,22 +530,28 @@ if run_button:
                 continue
             per_player_caps_idx[name_to_idx[name]] = max(0, min(cnt, NUM_LINEUPS))
 
-        # Pairs
+        # Pairs → index-based dict
         forced_pairs_idx = {}
         pair_requires_main_idx = {}
-        for (m_name, s_name), cnt in st.session_state.forced_pairs.items():
+        for _, row in st.session_state.pairs_df.iterrows():
+            m_name = row.get("Main")
+            s_name = row.get("Secondary")
+            together = int(row.get("Together") or 0)
+            req = bool(row.get("RequireMain"))
+
+            if not m_name or not s_name or m_name == s_name or together <= 0:
+                continue
             if m_name not in name_to_idx:
                 st.warning(f"Pair: main player '{m_name}' not found.")
                 continue
             if s_name not in name_to_idx:
                 st.warning(f"Pair: secondary player '{s_name}' not found.")
                 continue
+
             main_idx = name_to_idx[m_name]
             sec_idx = name_to_idx[s_name]
-            forced_pairs_idx[(main_idx, sec_idx)] = max(0, min(cnt, NUM_LINEUPS))
-            pair_requires_main_idx[(main_idx, sec_idx)] = bool(
-                st.session_state.pair_requires_main.get((m_name, s_name), False)
-            )
+            forced_pairs_idx[(main_idx, sec_idx)] = together
+            pair_requires_main_idx[(main_idx, sec_idx)] = req
 
         used_counts = {i: 0 for i in players.index}
 
