@@ -5,7 +5,7 @@ import streamlit as st
 from io import BytesIO
 
 # =============================================
-# GLOBAL CONFIG (these will be overwritten by UI)
+# GLOBAL DEFAULTS (will be overridden by UI)
 # =============================================
 
 PROJECTION_COL_DEFAULT = "FP_P75"
@@ -15,7 +15,7 @@ MIN_UNIQUE_PLAYERS = 2
 
 
 # =============================================
-# HELPER / CORE LOGIC
+# CORE HELPER / OPTIMIZER LOGIC
 # =============================================
 
 def parse_opponent(gameinfo, team):
@@ -50,6 +50,7 @@ def load_and_prepare_data(proj_file, sal_file, proj_col):
     """
     Load projections (Excel) and DK salaries (CSV), merge them, and compute
     a unified 'ProjPoints' column plus Opponent extraction.
+
     Returns:
       players_df, unmatched_dk_df, unmatched_proj_df
     """
@@ -79,11 +80,11 @@ def load_and_prepare_data(proj_file, sal_file, proj_col):
     )
 
     # Unmatched DK players (in DK but not in projections)
-    no_match = players[players["_merge"] == "left_only"].copy()
+    unmatched_dk = players[players["_merge"] == "left_only"].copy()
 
     # Unmatched projection players (in projections but not in DK)
     proj_check = proj.merge(dk[merge_cols], on=merge_cols, how="left", indicator=True)
-    no_proj = proj_check[proj_check["_merge"] == "left_only"].copy()
+    unmatched_proj = proj_check[proj_check["_merge"] == "left_only"].copy()
 
     players = players.drop(columns=["_merge"])
 
@@ -108,7 +109,7 @@ def load_and_prepare_data(proj_file, sal_file, proj_col):
     else:
         players["Opponent"] = None
 
-    return players, no_match, no_proj
+    return players, unmatched_dk, unmatched_proj
 
 
 def build_one_lineup(players,
@@ -123,6 +124,7 @@ def build_one_lineup(players,
     """
     Build a single lineup via MILP.
     Returns (lineup_df, flex_idx) or (None, None) if infeasible.
+
     Uses global SALARY_CAP and MIN_UNIQUE_PLAYERS.
     """
     candidate_ids = [i for i in players.index if used_counts[i] < max_allowed[i]]
@@ -134,7 +136,7 @@ def build_one_lineup(players,
 
     TOTAL = 9
 
-    # Objective
+    # Objective: maximize projected points
     prob += pulp.lpSum(players.loc[i, "ProjPoints"] * x[i] for i in candidate_ids)
 
     # Salary cap & total players
@@ -313,75 +315,6 @@ def restructure_lineup_for_export(lu, flex_idx, players, name_id_col):
     return rec
 
 
-def parse_simple_mapping(text, label, max_val):
-    """
-    Parse lines like: 'Player Name : 10'
-    Returns dict[name] = int_value.
-    Skips bad lines and returns warnings string.
-    """
-    mapping = {}
-    warnings = []
-    if not text.strip():
-        return mapping, warnings
-
-    for line in text.splitlines():
-        if not line.strip():
-            continue
-        if ":" not in line:
-            warnings.append(f"{label}: Could not parse line (missing ':'): {line}")
-            continue
-        name, val = line.split(":", 1)
-        name = name.strip()
-        try:
-            cnt = int(val.strip())
-        except ValueError:
-            warnings.append(f"{label}: Invalid integer for '{name}': {val}")
-            continue
-        cnt = max(0, min(cnt, max_val))
-        mapping[name] = cnt
-    return mapping, warnings
-
-
-def parse_forced_pairs(text, max_val):
-    """
-    Parse lines like:
-      Main Name | Pair Name | count | require_main (y/n)
-    return:
-      forced_pairs[(main, pair)] = count
-      pair_requires_main[(main, pair)] = bool
-    """
-    forced_pairs = {}
-    pair_requires_main = {}
-    warnings = []
-
-    if not text.strip():
-        return forced_pairs, pair_requires_main, warnings
-
-    for line in text.splitlines():
-        if not line.strip():
-            continue
-        parts = [p.strip() for p in line.split("|")]
-        if len(parts) < 3:
-            warnings.append(f"Pairs: Expected at least 'Main | Pair | Count': {line}")
-            continue
-        main_name, pair_name, cnt_str = parts[:3]
-        require_flag = parts[3].lower() if len(parts) > 3 else "n"
-
-        try:
-            cnt = int(cnt_str)
-        except ValueError:
-            warnings.append(f"Pairs: Invalid count in line: {line}")
-            continue
-        cnt = max(0, min(cnt, max_val))
-        if cnt == 0:
-            continue
-
-        forced_pairs[(main_name, pair_name)] = cnt
-        pair_requires_main[(main_name, pair_name)] = (require_flag in ("y", "yes", "1", "true"))
-
-    return forced_pairs, pair_requires_main, warnings
-
-
 # =============================================
 # STREAMLIT APP
 # =============================================
@@ -394,17 +327,19 @@ st.markdown(
     "and generate optimized lineups with exposures and constraints."
 )
 
-# ---------- FILE UPLOADS ----------
+# ---------- SIDEBAR: FILES + GLOBAL SETTINGS ----------
 with st.sidebar:
     st.header("Step 1: Upload Files")
     proj_file = st.file_uploader("Projection Excel (.xlsx)", type=["xlsx"])
     salary_file = st.file_uploader("DK Salaries CSV (.csv)", type=["csv"])
 
     st.header("Step 2: Global Settings")
-    NUM_LINEUPS = st.number_input("Number of Lineups", 1, 150, 20)
-    SALARY_CAP = st.number_input("Salary Cap", 20000, 100000, 50000, step=500)
-    MIN_UNIQUE_PLAYERS = st.number_input("Min Unique Players vs Previous", 1, 9, 2)
-    min_non_dst_salary = st.number_input("Min Salary for NON-DST players", 0, 20000, 0, step=500)
+    NUM_LINEUPS = int(st.number_input("Number of Lineups", 1, 150, 20))
+    SALARY_CAP = int(st.number_input("Salary Cap", 20000, 100000, 50000, step=500))
+    MIN_UNIQUE_PLAYERS = int(st.number_input("Min Unique Players vs Previous", 1, 9, 2))
+    min_non_dst_salary = int(
+        st.number_input("Min Salary for NON-DST players", 0, 20000, 0, step=500)
+    )
 
     st.markdown("---")
     st.subheader("FLEX Eligibility")
@@ -421,18 +356,17 @@ if proj_file is None or salary_file is None:
 # ---------- LOAD DATA ----------
 st.header("Data & Projection Setup")
 
-# Peek at projections to choose projection column
+# Preview projection file to choose projection column
 proj_preview = pd.read_excel(proj_file, nrows=5)
 st.subheader("Projection File Preview")
 st.dataframe(proj_preview)
 
 proj_cols = [c for c in proj_preview.columns if c not in ["Name", "Position", "TeamAbbrev", "Team", "Opp"]]
-default_proj_col = PROJECTION_COL_DEFAULT if PROJECTION_COL_DEFAULT in proj_cols else (proj_cols[0] if proj_cols else None)
-
 if not proj_cols:
-    st.error("No projection columns found. Make sure your file has at least one numeric column with projections.")
+    st.error("No projection columns found. Make sure your file has at least one numeric projection column.")
     st.stop()
 
+default_proj_col = PROJECTION_COL_DEFAULT if PROJECTION_COL_DEFAULT in proj_cols else proj_cols[0]
 PROJECTION_COL = st.selectbox("Projection Column to Use", proj_cols, index=proj_cols.index(default_proj_col))
 
 with st.spinner("Merging projections with salaries..."):
@@ -443,7 +377,7 @@ st.success(f"Loaded {len(players)} players with salaries and projections.")
 col1, col2 = st.columns(2)
 
 with col1:
-    st.subheader("DK Salary Preview (Merged)")
+    st.subheader("Merged Player Data Preview")
     st.dataframe(players.head(20))
 
 with col2:
@@ -458,102 +392,236 @@ with col2:
         else:
             st.dataframe(unmatched_proj[["Name", "Position", "TeamAbbrev"]])
 
+# ---------- INIT SESSION STATE FOR UI-BASED RULES ----------
+if "forced_players" not in st.session_state:
+    st.session_state.forced_players = {}          # {player_name: min_lineups}
+if "caps" not in st.session_state:
+    st.session_state.caps = {}                    # {player_name: max_lineups}
+if "forced_pairs" not in st.session_state:
+    st.session_state.forced_pairs = {}            # {(main_name, sec_name): count}
+if "pair_requires_main" not in st.session_state:
+    st.session_state.pair_requires_main = {}      # {(main_name, sec_name): bool}
 
-# ---------- EXPOSURES & PAIRS ----------
-st.header("Exposures & Constraints (Optional)")
 
-st.markdown("### Forced Player Minimum Lineups")
-st.markdown("Format: `Player Name : MinLineups` (one per line). Example:")
-st.code("Christian McCaffrey : 10\nCeeDee Lamb : 8")
-forced_text = st.text_area("Forced Minimum Exposures", height=120)
+# ---------- EXPOSURES & CONSTRAINTS UI ----------
+st.header("Exposures & Constraints")
 
-st.markdown("### Per-Player Maximum Lineups")
-st.markdown("Format: `Player Name : MaxLineups` (one per line). Example:")
-st.code("Christian McCaffrey : 12\nCeeDee Lamb : 10")
-caps_text = st.text_area("Per-Player Max Caps", height=120)
+player_list_sorted = sorted(players["Name"].unique())
 
-st.markdown("### Forced Pairs")
-st.markdown(
-    "Format: `Main Name | Pair Name | Count | require_main(y/n)` (one per line).\n"
-    "- `Count` = number of lineups where they **must appear together**.\n"
-    "- `require_main=y` means the pair player **cannot appear without** the main player."
-)
-st.code("Brock Purdy | Brandon Aiyuk | 10 | y\nDak Prescott | CeeDee Lamb | 8 | n")
-pairs_text = st.text_area("Forced Pairs", height=120)
+# ----- Forced Minimum Exposures -----
+with st.expander("Forced Minimum Lineups (Required Appearances)", expanded=True):
+    c1, c2, c3 = st.columns([3, 1.5, 1.5])
+    with c1:
+        forced_name = st.selectbox(
+            "Select player to FORCE",
+            [""] + player_list_sorted,
+            key="forced_name_select",
+            help="Player will be forced into at least this many lineups."
+        )
+    with c2:
+        forced_count = st.number_input(
+            "Minimum lineups",
+            0, NUM_LINEUPS, 0,
+            key="forced_count_input"
+        )
+    with c3:
+        if st.button("Add / Update Forced Player", key="forced_add_btn"):
+            if forced_name != "":
+                st.session_state.forced_players[forced_name] = forced_count
 
-# Parse all text inputs
-forced_by_name, forced_warnings = parse_simple_mapping(forced_text, "Forced", int(NUM_LINEUPS))
-caps_by_name, caps_warnings = parse_simple_mapping(caps_text, "Caps", int(NUM_LINEUPS))
-pairs_by_name, pair_requires_name, pair_warnings = parse_forced_pairs(pairs_text, int(NUM_LINEUPS))
+    if st.session_state.forced_players:
+        st.markdown("**Current Forced Players**")
+        df_forced = pd.DataFrame(
+            [
+                {"Player": name, "Min Lineups": cnt}
+                for name, cnt in st.session_state.forced_players.items()
+            ]
+        )
+        st.table(df_forced)
 
-for w in forced_warnings + caps_warnings + pair_warnings:
-    st.warning(w)
+        rm_name = st.selectbox(
+            "Remove a forced player (optional)",
+            [""] + list(st.session_state.forced_players.keys()),
+            key="forced_remove_select"
+        )
+        if st.button("Remove Forced Player", key="forced_remove_btn"):
+            if rm_name in st.session_state.forced_players:
+                del st.session_state.forced_players[rm_name]
 
-# Build name -> index map
-name_to_idx = (
-    players.reset_index()
-    .set_index("Name")["index"]
-    .to_dict()
-)
+# ----- Max Caps -----
+with st.expander("Max Lineups Per Player (Caps)", expanded=False):
+    c1, c2, c3 = st.columns([3, 1.5, 1.5])
+    with c1:
+        cap_name = st.selectbox(
+            "Select player to CAP",
+            [""] + player_list_sorted,
+            key="cap_name_select",
+            help="Player will appear in at most this many lineups."
+        )
+    with c2:
+        cap_count = st.number_input(
+            "Max lineups",
+            0, NUM_LINEUPS, NUM_LINEUPS,
+            key="cap_count_input"
+        )
+    with c3:
+        if st.button("Add / Update Cap", key="cap_add_btn"):
+            if cap_name != "":
+                st.session_state.caps[cap_name] = cap_count
 
-forced_players = {}
-for name, cnt in forced_by_name.items():
-    if name not in name_to_idx:
-        st.warning(f"Forced exposure: player '{name}' not found in merged data.")
-        continue
-    forced_players[name_to_idx[name]] = cnt
+    if st.session_state.caps:
+        st.markdown("**Current Caps**")
+        df_caps = pd.DataFrame(
+            [
+                {"Player": name, "Max Lineups": cnt}
+                for name, cnt in st.session_state.caps.items()
+            ]
+        )
+        st.table(df_caps)
 
-per_player_caps = {}
-for name, cnt in caps_by_name.items():
-    if name not in name_to_idx:
-        st.warning(f"Cap: player '{name}' not found in merged data.")
-        continue
-    per_player_caps[name_to_idx[name]] = cnt
+        rm_cap_name = st.selectbox(
+            "Remove a cap (optional)",
+            [""] + list(st.session_state.caps.keys()),
+            key="cap_remove_select"
+        )
+        if st.button("Remove Cap", key="cap_remove_btn"):
+            if rm_cap_name in st.session_state.caps:
+                del st.session_state.caps[rm_cap_name]
 
-forced_pairs = {}
-pair_requires_main = {}
-for (main_name, pair_name), cnt in pairs_by_name.items():
-    if main_name not in name_to_idx:
-        st.warning(f"Pairs: main player '{main_name}' not found.")
-        continue
-    if pair_name not in name_to_idx:
-        st.warning(f"Pairs: secondary player '{pair_name}' not found.")
-        continue
-    main_idx = name_to_idx[main_name]
-    pair_idx = name_to_idx[pair_name]
-    forced_pairs[(main_idx, pair_idx)] = cnt
-    pair_requires_main[(main_idx, pair_idx)] = pair_requires_name[(main_name, pair_name)]
+# ----- Forced Pairs -----
+with st.expander("Forced Pairs (Stacks / Correlations)", expanded=False):
+    c1, c2 = st.columns(2)
+    with c1:
+        pair_main = st.selectbox(
+            "Main Player",
+            [""] + player_list_sorted,
+            key="pair_main_select"
+        )
+    with c2:
+        pair_secondary = st.selectbox(
+            "Secondary Player",
+            [""] + player_list_sorted,
+            key="pair_secondary_select"
+        )
 
+    c3, c4, c5 = st.columns([1.5, 2, 2])
+    with c3:
+        pair_count = st.number_input(
+            "Lineups together",
+            0, NUM_LINEUPS, 0,
+            key="pair_count_input",
+            help="Number of lineups where these two players MUST appear together."
+        )
+    with c4:
+        pair_require = st.checkbox(
+            "Secondary CANNOT appear without Main",
+            key="pair_require_checkbox",
+            help="If checked, the secondary player may only appear in lineups where the main player is also present."
+        )
+    with c5:
+        if st.button("Add / Update Pair", key="pair_add_btn"):
+            if pair_main and pair_secondary and pair_main != pair_secondary:
+                key_pair = (pair_main, pair_secondary)
+                st.session_state.forced_pairs[key_pair] = pair_count
+                st.session_state.pair_requires_main[key_pair] = pair_require
+
+    if st.session_state.forced_pairs:
+        st.markdown("**Current Forced Pairs**")
+        df_pairs = []
+        for (m, s), cnt in st.session_state.forced_pairs.items():
+            df_pairs.append({
+                "Main": m,
+                "Secondary": s,
+                "Lineups Together": cnt,
+                "Secondary Requires Main?": st.session_state.pair_requires_main.get((m, s), False)
+            })
+        st.table(pd.DataFrame(df_pairs))
+
+        all_pair_labels = [
+            f"{m} + {s}" for (m, s) in st.session_state.forced_pairs.keys()
+        ]
+        rm_pair_label = st.selectbox(
+            "Remove a pair (optional)",
+            [""] + all_pair_labels,
+            key="pair_remove_select"
+        )
+        if st.button("Remove Pair", key="pair_remove_btn"):
+            if rm_pair_label != "":
+                idx = all_pair_labels.index(rm_pair_label)
+                key_to_remove = list(st.session_state.forced_pairs.keys())[idx]
+                del st.session_state.forced_pairs[key_to_remove]
+                if key_to_remove in st.session_state.pair_requires_main:
+                    del st.session_state.pair_requires_main[key_to_remove]
 
 # ---------- RUN OPTIMIZER ----------
 run_button = st.button("🚀 Generate Lineups")
 
 if run_button:
     with st.spinner("Solving optimization model and generating lineups..."):
+        # Map player names -> indices
+        name_to_idx = (
+            players.reset_index()
+                   .set_index("Name")["index"]
+                   .to_dict()
+        )
+
+        # Convert forced exposures to index-based dict
+        forced_players_idx = {}
+        for name, cnt in st.session_state.forced_players.items():
+            if name not in name_to_idx:
+                st.warning(f"Forced exposure: player '{name}' not found in merged data.")
+                continue
+            forced_players_idx[name_to_idx[name]] = max(0, min(cnt, NUM_LINEUPS))
+
+        # Convert caps to index-based dict
+        per_player_caps_idx = {}
+        for name, cnt in st.session_state.caps.items():
+            if name not in name_to_idx:
+                st.warning(f"Cap: player '{name}' not found in merged data.")
+                continue
+            per_player_caps_idx[name_to_idx[name]] = max(0, min(cnt, NUM_LINEUPS))
+
+        # Convert pairs to index-based dicts
+        forced_pairs_idx = {}
+        pair_requires_main_idx = {}
+        for (m_name, s_name), cnt in st.session_state.forced_pairs.items():
+            if m_name not in name_to_idx:
+                st.warning(f"Pair: main player '{m_name}' not found.")
+                continue
+            if s_name not in name_to_idx:
+                st.warning(f"Pair: secondary player '{s_name}' not found.")
+                continue
+            main_idx = name_to_idx[m_name]
+            sec_idx = name_to_idx[s_name]
+            forced_pairs_idx[(main_idx, sec_idx)] = max(0, min(cnt, NUM_LINEUPS))
+            pair_requires_main_idx[(main_idx, sec_idx)] = bool(
+                st.session_state.pair_requires_main.get((m_name, s_name), False)
+            )
+
         used_counts = {i: 0 for i in players.index}
 
         # Build max exposure per player
         max_allowed = {}
         for i in players.index:
-            forced_min = forced_players.get(i, 0)
-            cap = per_player_caps.get(i, int(NUM_LINEUPS))
+            forced_min = forced_players_idx.get(i, 0)
+            cap = per_player_caps_idx.get(i, NUM_LINEUPS)
             max_allowed[i] = max(cap, forced_min)
 
         all_lineups = []
         prev_lineups = []
         flex_indices = []
 
-        # Make local mutable copies for the iterative decrements
-        forced_players_iter = forced_players.copy()
-        forced_pairs_iter = forced_pairs.copy()
+        # Make local mutable copies for iterative decrements
+        forced_players_iter = forced_players_idx.copy()
+        forced_pairs_iter = forced_pairs_idx.copy()
 
-        for k in range(int(NUM_LINEUPS)):
+        for k in range(NUM_LINEUPS):
             lu, flex_idx = build_one_lineup(
                 players,
                 prev_lineups,
                 forced_players_iter,
                 forced_pairs_iter,
-                pair_requires_main,
+                pair_requires_main_idx,
                 max_allowed,
                 used_counts,
                 flex_allowed,
@@ -584,13 +652,13 @@ if run_button:
         else:
             st.success(f"Generated {len(all_lineups)} lineups.")
 
-            # Display lineups one by one
+            # Display lineups
             for i, (lu, fidx) in enumerate(zip(all_lineups, flex_indices), start=1):
                 total_salary = int(lu["Salary"].sum())
                 total_proj = float(lu["ProjPoints"].sum())
                 st.subheader(f"Lineup {i} — Salary: {total_salary}, Proj: {total_proj:.2f}")
 
-                # Mark slots (QB/RB/WR/TE/FLEX/DST) for viewing
+                # Add Slot info for viewing
                 lu_display = lu.copy()
                 lu_display["Slot"] = lu_display.index.map(
                     lambda idx: "FLEX" if idx == fidx else lu_display.loc[idx, "Position"]
